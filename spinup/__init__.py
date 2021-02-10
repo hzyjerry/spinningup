@@ -14,12 +14,14 @@ from spinup.algos.tf1.vpg.vpg import vpg as vpg_tf1
 from spinup.algos.pytorch.ddpg.ddpg import ddpg as ddpg_pytorch
 from spinup.algos.pytorch.ppo.ppo import ppo as ppo_pytorch
 from spinup.algos.pytorch.sac.sac import sac as sac_pytorch
+from spinup.algos.pytorch.sac.sac import sac_upn as sac_upn_pytorch
 from spinup.algos.pytorch.td3.td3 import td3 as td3_pytorch
 from spinup.algos.pytorch.trpo.trpo import trpo as trpo_pytorch
 from spinup.algos.pytorch.vpg.vpg import vpg as vpg_pytorch
 
 # Loggers
 from spinup.utils.logx import Logger, EpochLogger
+from spinup.utils.test_policy import load_policy_and_env
 
 # Version
 from spinup.version import __version__

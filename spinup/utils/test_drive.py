@@ -61,8 +61,8 @@ def load_policy_and_env(fpath, itr='last', deterministic=False, return_model=Fal
     try:
         state = joblib.load(osp.join(fpath, 'vars'+itr+'.pkl'))
         import gym
-        # env = gym.make(state["env_name"])
-        env = state['env']
+        env = gym.make(state["env_name"])
+        # env = state['env']
     except:
         env = None
         # import gym
@@ -121,6 +121,10 @@ def load_pytorch_policy(fpath, itr, deterministic=False):
 
 def run_policy(env, get_action, max_ep_len=None, num_episodes=100, render=True):
 
+    from upn.visualize.render import forward_env
+    from numpngw import write_apng
+
+
     assert env is not None, \
         "Environment not found!\n\n It looks like the environment wasn't saved, " + \
         "and we can't run the agent in it. :( \n\n Check out the readthedocs " + \
@@ -129,12 +133,13 @@ def run_policy(env, get_action, max_ep_len=None, num_episodes=100, render=True):
     logger = EpochLogger()
     all_feats = []
     o, r, d, ep_ret, ep_len, n = env.reset(), 0, False, 0, 0, 0
+    acs = []
     while n < num_episodes:
         if render:
-            env.render(episode=n)
+            env.render()
             time.sleep(1e-3)
-
         a = get_action(o)
+        acs.append(a)
         o, r, d, info = env.step(a)
         ep_ret += r
         ep_len += 1
@@ -148,7 +153,14 @@ def run_policy(env, get_action, max_ep_len=None, num_episodes=100, render=True):
             logger.store(EpRet=ep_ret, EpLen=ep_len)
             print('Episode %d \t EpRet %.3f \t EpLen %d'%(n, ep_ret, ep_len))
             o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+
+            frames = forward_env(env, np.array(acs), batch=False, subrender=False, resize=0.4)
+            fps = 10
+            write_apng(os.path.join(args.fpath, f"rollout_{n:02d}.png"), frames, delay=1000/fps)
+            o = env.reset()
+
             all_feats = []
+            acs = []
             n += 1
 
     logger.log_tabular('EpRet', with_min_and_max=True)
@@ -161,7 +173,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('fpath', type=str)
     parser.add_argument('--len', '-l', type=int, default=0)
-    parser.add_argument('--episodes', '-n', type=int, default=100)
+    parser.add_argument('--episodes', '-n', type=int, default=60)
     parser.add_argument('--norender', '-nr', action='store_true')
     parser.add_argument('--itr', '-i', type=int, default=-1)
     parser.add_argument('--deterministic', '-d', action='store_true')

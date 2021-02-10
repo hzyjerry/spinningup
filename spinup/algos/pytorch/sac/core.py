@@ -52,8 +52,8 @@ class SquashedGaussianMLPActor(nn.Module):
 
         if with_logprob:
             # Compute logprob from Gaussian, and then apply correction for Tanh squashing.
-            # NOTE: The correction formula is a little bit magic. To get an understanding 
-            # of where it comes from, check out the original SAC paper (arXiv 1801.01290) 
+            # NOTE: The correction formula is a little bit magic. To get an understanding
+            # of where it comes from, check out the original SAC paper (arXiv 1801.01290)
             # and look in appendix C. This is a more numerically-stable equivalent to Eq 21.
             # Try deriving it yourself as a (very difficult) exercise. :)
             logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
@@ -91,6 +91,53 @@ class MLPActorCritic(nn.Module):
         self.pi = SquashedGaussianMLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit)
         self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
         self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
+
+    def act(self, obs, deterministic=False):
+        with torch.no_grad():
+            a, _ = self.pi(obs, deterministic, False)
+            return a.numpy()
+
+
+
+###########################################################
+###         Universal Planning Network                  ###
+###########################################################
+
+class MLPQFunctionUPN(nn.Module):
+
+    def __init__(self, obs_dim, act_dim, coeff_dim, hidden_sizes, activation):
+        super().__init__()
+        self.coeff_dim = coeff_dim
+        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [coeff_dim], activation)
+
+    def forward(self, obs, act):
+        coeffs = obs[..., -self.coeff_dim:]
+        fc = self.q(torch.cat([obs, act], dim=-1))   # (nbatch, coeff_dim)
+        q = torch.mul(fc, coeffs).sum(-1)         # (nbatch, 1)
+        return torch.squeeze(q, -1) # Critical to ensure q has right shape.
+
+    def predict_feats(self, obs, act):
+        coeffs = obs[..., -self.coeff_dim:]
+        fc = self.q(torch.cat([obs, act], dim=-1))   # (nbatch, coeff_dim)
+        return fc
+
+
+class MLPActorCriticUPNNaive(nn.Module):
+
+    """ Universal planning network with Naive skip connection
+    """
+
+    def __init__(self, observation_space, action_space, hidden_sizes=(256,256), activation=nn.ReLU, coeff_dim=1):
+        super().__init__()
+
+        obs_dim = observation_space.shape[0]
+        act_dim = action_space.shape[0]
+        act_limit = action_space.high[0]
+
+        # build policy and value functions
+        self.pi = SquashedGaussianMLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit)
+        self.q1 = MLPQFunctionUPN(obs_dim, act_dim, coeff_dim, hidden_sizes, activation)
+        self.q2 = MLPQFunctionUPN(obs_dim, act_dim, coeff_dim, hidden_sizes, activation)
 
     def act(self, obs, deterministic=False):
         with torch.no_grad():
