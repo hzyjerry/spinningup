@@ -138,7 +138,7 @@ def call_experiment(exp_name, thunk, seed=0, num_cpu=1, data_dir=None,
     print(exp_name + '\n')
     print(colorize('with kwargs:\n', color='cyan', bold=True))
     kwargs_json = convert_json(kwargs)
-    print(json.dumps(kwargs_json, separators=(',',':\t'), indent=4, sort_keys=True))
+    # print(json.dumps(kwargs_json, separators=(',',':\t'), indent=4, sort_keys=True))
     print('\n')
 
     # Set up logger output directory
@@ -146,7 +146,6 @@ def call_experiment(exp_name, thunk, seed=0, num_cpu=1, data_dir=None,
         kwargs['logger_kwargs'] = setup_logger_kwargs(exp_name, seed, data_dir, datestamp)
     else:
         print('Note: Call experiment is not handling logger_kwargs.\n')
-
     def thunk_plus():
         # Make 'env_fn' from 'env_name'
         if 'env_name' in kwargs:
@@ -154,6 +153,9 @@ def call_experiment(exp_name, thunk, seed=0, num_cpu=1, data_dir=None,
             env_name = kwargs['env_name']
             kwargs['env_fn'] = lambda : gym.make(env_name)
             del kwargs['env_name']
+        if 'test_env_names' in kwargs:
+            kwargs['test_env_fns'] = [lambda name=name: gym.make(name) for name in kwargs["test_env_names"]]
+            del kwargs['test_env_names']
 
         # Fork into multiple processes
         mpi_fork(num_cpu)

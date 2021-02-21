@@ -4,26 +4,37 @@ from functools import partial
 import upn.envs
 import torch
 
-# env_name = 'PointIRL-v1'
-env_name = 'DriveGen0_01-v03'
-
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--cpu', type=int, default=4)
-    parser.add_argument('--num_runs', type=int, default=3)
-    args = parser.parse_args()
+    import argparse, yaml
+    from dotmap import DotMap
 
-    eg = ExperimentGrid(name='sac-upn-pyt-bench')
-    eg.add('env_name', env_name, '', True)
-    # eg.add('seed', [10*i for i in range(args.num_runs)])
-    eg.add('seed', 0)
-    eg.add('epochs', 200)
-    eg.add('steps_per_epoch', 4000)
-    # eg.add('ac_kwargs:hidden_sizes', [(32, 32), (64,64)], 'hid')
-    # eg.add('ac_kwargs:activation', [torch.nn.Tanh, torch.nn.ReLU], '')
-    eg.add('alpha', [0.1, 0.2, 0.4])
-    eg.add('ac_kwargs:hidden_sizes', [(32, 32, 32)], 'hid')
-    eg.add('ac_kwargs:activation', [torch.nn.ReLU], '')
-    eg.run(partial(sac_upn_pytorch, env_name=env_name), num_cpu=args.cpu)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('params_file', type=str, default=None)
+    parser.add_argument('--date', type=str, default=None)
+    args = parser.parse_args()
+    assert args.params_file is not None
+    params = None
+    with open(args.params_file) as f:
+        params = DotMap(yaml.load(f))
+
+
+    eg = ExperimentGrid(name=params.name)
+    eg.add('env_name', params.env_name, '', True)
+    eg.add('test_env_names', params.test_env_names, "test", False)
+    eg.add('seed', params.seed)
+    eg.add('epochs', params.epochs)
+    eg.add('steps_per_epoch', params.steps_per_epoch)
+    eg.add('update_after', params.update_after)
+    eg.add('alpha', params.alpha, 'alp', True)
+    eg.add('ac_kwargs:hidden_sizes', params.hidden_sizes, 'hid')
+
+    activation = None
+    if params.activation == "relu":
+        activation = torch.nn.ReLU
+    elif params.activation == "tanh":
+        activation = torch.nn.Tanh
+
+    eg.add('ac_kwargs:activation', activation, '')
+    eg.run(partial(sac_upn_pytorch, env_name=params.env_name), num_cpu=params.cpu, data_dir=f"data/{args.date}")
+

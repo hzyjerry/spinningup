@@ -9,6 +9,8 @@ import time
 import spinup.algos.pytorch.sac.core as core
 from spinup.utils.logx import EpochLogger
 from functools import partial
+from torch.utils.tensorboard import SummaryWriter
+
 
 
 class ReplayBuffer:
@@ -44,14 +46,14 @@ class ReplayBuffer:
 
 
 
-def sac_upn(env_fn, env_name, actor_critic=core.MLPActorCriticUPNNaive, **kwargs):
+def sac_upn(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCriticUPNNaive, **kwargs):
     env = env_fn()
     coeff_dim = env.coeff_dim
     _actor_critic = partial(actor_critic, coeff_dim=coeff_dim)
-    return sac(env_fn, env_name, actor_critic=_actor_critic, **kwargs)
+    return sac(env_fn, env_name, test_env_fns=test_env_fns, actor_critic=_actor_critic, **kwargs)
 
 
-def sac(env_fn, env_name, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
+def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99,
         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=100, start_steps=10000,
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000,
@@ -153,13 +155,14 @@ def sac(env_fn, env_name, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
 
     """
 
+    writer = SummaryWriter(comment=logger_kwargs["exp_name"])
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    env, test_env = env_fn(), env_fn()
+    env, test_envs = env_fn(), [fn() for fn in test_env_fns]
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape[0]
 
@@ -277,14 +280,19 @@ def sac(env_fn, env_name, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
                       deterministic)
 
     def test_agent():
-        for j in range(num_test_episodes):
-            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
-            while not(d or (ep_len == max_ep_len)):
-                # Take deterministic actions at test time
-                o, r, d, _ = test_env.step(get_action(o, True))
-                ep_ret += r
-                ep_len += 1
-            logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+        for ti, test_env in enumerate(test_envs):
+            import pdb; pdb.set_trace()
+            env_ep_ret = 0
+            for j in range(num_test_episodes):
+                o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
+                while not (d or (ep_len == max_ep_len)):
+                    # Take deterministic actions at test time
+                    o, r, d, _ = test_env.step(get_action(o, True))
+                    ep_ret += r
+                    ep_len += 1
+                    env_ep_ret += r
+                logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+            logger.store(**{f"TestEpRet_{ti}": env_ep_ret / num_test_episodes})
 
     # Prepare for interaction with environment
     total_steps = steps_per_epoch * epochs
@@ -345,6 +353,19 @@ def sac(env_fn, env_name, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
             # Test the performance of the deterministic version of the agent.
             test_agent()
 
+            # Update tensorboard
+            log_perf_board = ['EpRet','EpLen','Q1Vals','Q2Vals', 'TestEpRet','TestEpLen'] + [f"TestEpRet_{ti}" for ti in range(len(test_env_fns))]
+            log_loss_board = ['LogPi', 'LossPi','LossQ']
+            log_board = {'Performance': log_perf_board, 'Loss': log_loss_board}
+            for key,value in log_board.items():
+                for val in value:
+                    mean, std = logger.get_stats(val)
+                    if key=='Performance':
+                        writer.add_scalar(key+'/Average'+val, mean, epoch)
+                        writer.add_scalar(key+'/Std'+val, std, epoch)
+                    else:
+                        writer.add_scalar(key+'/'+val, mean, epoch)
+
             # Log info about epoch
             logger.log_tabular('Epoch', epoch)
             logger.log_tabular('EpRet', with_min_and_max=True)
@@ -359,6 +380,10 @@ def sac(env_fn, env_name, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
             logger.log_tabular('LossQ', average_only=True)
             logger.log_tabular('Time', time.time()-start_time)
             logger.dump_tabular()
+
+            writer.flush()
+    writer.close()
+
 
 if __name__ == '__main__':
     import argparse
