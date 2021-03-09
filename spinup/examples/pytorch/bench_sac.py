@@ -39,7 +39,6 @@ if __name__ == '__main__':
         params.save_dir = params.cloud_dir
 
     eg.add('ac_kwargs:activation', activation, '')
-
     if params.use_upn:
         eg.run(partial(sac_upn_pytorch, env_name=params.env_name, load_dir=params.load_dir, num_procs=params.num_procs), num_cpu=params.cpu, data_dir=f"{params.save_dir}/{params.date}", params=params.toDict(), pickle=params.pickle)
     else:

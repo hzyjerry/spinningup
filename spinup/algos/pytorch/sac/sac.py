@@ -284,7 +284,7 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
 
         # Useful info for logging
         feats_info = dict(Feats1Vals=feats1.detach().numpy(),
-                          Feats2Vals=feats1.detach().numpy())
+                          Feats2Vals=feats2.detach().numpy())
 
         return loss_feats, feats_info
 
@@ -316,15 +316,16 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
         q_optimizer.zero_grad()
         loss_q, q_info = compute_loss_q(data)
         loss_q.backward()
+        loss_feats, feats_info = compute_loss_feats(data)
         q_optimizer.step()
 
         # Record things
         logger.store(LossQ=loss_q.item(), **q_info)
 
         # Feature loss
-        loss_feats, feats_info = compute_loss_feats(data)
         keys = [f"LossFeats_{key}" for key in feats_keys]
-        logger.store(**dict(zip(keys, loss_feats)))
+        for key, val in zip(keys, loss_feats):
+            logger.store(**dict(key, val.item()))
 
         # Freeze Q-networks so you don't waste computational effort
         # computing gradients for them during the policy learning step.
