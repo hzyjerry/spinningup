@@ -149,6 +149,11 @@ class Logger:
             logger = EpochLogger(**logger_kwargs)
             logger.save_config(locals())
         """
+        if "env" in config:
+            del config["env"]
+        if "test_env" in config:
+            del config["test_env"]
+
         config_json = convert_json(config)
         if self.exp_name is not None:
             config_json['exp_name'] = self.exp_name
@@ -285,6 +290,7 @@ class Logger:
             keystr = '%'+'%d'%max_key_len
             fmt = "| " + keystr + "s | %15s |"
             n_slashes = 22 + max_key_len
+            print(f"Proc id {proc_id()}")
             print("-"*n_slashes)
             for key in self.log_headers:
                 val = self.log_current_row.get(key, "")

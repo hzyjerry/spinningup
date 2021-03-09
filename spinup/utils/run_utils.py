@@ -9,6 +9,7 @@ import cloudpickle
 import json
 import numpy as np
 import os
+import yaml
 import os.path as osp
 import psutil
 import string
@@ -22,7 +23,7 @@ import zlib
 
 DIV_LINE_WIDTH = 80
 
-def setup_logger_kwargs(exp_name, seed=None, data_dir=None, datestamp=False):
+def setup_logger_kwargs(exp_name, seed=None, data_dir=None, params={}, datestamp=False):
     """
     Sets up the output_dir for a logger and returns a dict for logger kwargs.
 
@@ -81,13 +82,20 @@ def setup_logger_kwargs(exp_name, seed=None, data_dir=None, datestamp=False):
         relpath = osp.join(relpath, subfolder)
 
     data_dir = data_dir or DEFAULT_DATA_DIR
-    logger_kwargs = dict(output_dir=osp.join(data_dir, relpath),
+    output_dir = osp.join(data_dir, relpath)
+    logger_kwargs = dict(output_dir=output_dir,
                          exp_name=exp_name)
+
+    # Save parameters
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "params.yaml"), "w+") as f:
+        yaml.dump(params, f)
+
     return logger_kwargs
 
 
 def call_experiment(exp_name, thunk, seed=0, num_cpu=1, data_dir=None,
-                    datestamp=False, **kwargs):
+                    datestamp=False, params={}, pickle=True, **kwargs):
     """
     Run a function (thunk) with hyperparameters (kwargs), plus configuration.
 
@@ -143,47 +151,64 @@ def call_experiment(exp_name, thunk, seed=0, num_cpu=1, data_dir=None,
 
     # Set up logger output directory
     if 'logger_kwargs' not in kwargs:
-        kwargs['logger_kwargs'] = setup_logger_kwargs(exp_name, seed, data_dir, datestamp)
+        kwargs['logger_kwargs'] = setup_logger_kwargs(exp_name, seed, data_dir, params, datestamp)
     else:
         print('Note: Call experiment is not handling logger_kwargs.\n')
     def thunk_plus():
         # Make 'env_fn' from 'env_name'
         if 'env_name' in kwargs:
             import gym
+            import upn.envs
             env_name = kwargs['env_name']
-            kwargs['env_fn'] = lambda : gym.make(env_name)
+            def env_fn(rank=0):
+                import upn.envs
+                env = gym.make(env_name)
+                env.seed(seed + rank)
+                return env
+            kwargs['env_fn'] = env_fn
             del kwargs['env_name']
         if 'test_env_names' in kwargs:
-            kwargs['test_env_fns'] = [lambda name=name: gym.make(name) for name in kwargs["test_env_names"]]
+            kwargs['test_env_fns'] = []
+            for name in kwargs["test_env_names"]:
+                def env_fn(name=name, rank=0):
+                    import upn.envs
+                    env = gym.make(name)
+                    env.seed(seed + rank)
+                    return env
+                kwargs['test_env_fns'].append(env_fn)
             del kwargs['test_env_names']
 
         # Fork into multiple processes
-        mpi_fork(num_cpu)
+        # mpi_fork(num_cpu)
 
         # Run thunk
+        print("__name__", __name__)
         thunk(**kwargs)
 
-    # Prepare to launch a script to run the experiment
-    pickled_thunk = cloudpickle.dumps(thunk_plus)
-    encoded_thunk = base64.b64encode(zlib.compress(pickled_thunk)).decode('utf-8')
+    if pickle:
+        # Prepare to launch a script to run the experiment
+        pickled_thunk = cloudpickle.dumps(thunk_plus)
+        encoded_thunk = base64.b64encode(zlib.compress(pickled_thunk)).decode('utf-8')
 
-    entrypoint = osp.join(osp.abspath(osp.dirname(__file__)),'run_entrypoint.py')
-    cmd = [sys.executable if sys.executable else 'python', entrypoint, encoded_thunk]
-    try:
-        subprocess.check_call(cmd, env=os.environ)
-    except CalledProcessError:
-        err_msg = '\n'*3 + '='*DIV_LINE_WIDTH + '\n' + dedent("""
+        entrypoint = osp.join(osp.abspath(osp.dirname(__file__)),'run_entrypoint.py')
+        cmd = [sys.executable if sys.executable else 'python', entrypoint, encoded_thunk]
+        try:
+            subprocess.check_call(cmd, env=os.environ)
+        except CalledProcessError:
+            err_msg = '\n'*3 + '='*DIV_LINE_WIDTH + '\n' + dedent("""
 
-            There appears to have been an error in your experiment.
+                There appears to have been an error in your experiment.
 
-            Check the traceback above to see what actually went wrong. The
-            traceback below, included for completeness (but probably not useful
-            for diagnosing the error), shows the stack leading up to the
-            experiment launch.
+                Check the traceback above to see what actually went wrong. The
+                traceback below, included for completeness (but probably not useful
+                for diagnosing the error), shows the stack leading up to the
+                experiment launch.
 
-            """) + '='*DIV_LINE_WIDTH + '\n'*3
-        print(err_msg)
-        raise
+                """) + '='*DIV_LINE_WIDTH + '\n'*3
+            print(err_msg)
+            raise
+    else:
+        thunk_plus()
 
     # Tell the user about where results are, and how to check them
     logger_kwargs = kwargs['logger_kwargs']
@@ -479,7 +504,7 @@ class ExperimentGrid:
         new_variants = [unflatten_var(var) for var in flat_variants]
         return new_variants
 
-    def run(self, thunk, num_cpu=1, data_dir=None, datestamp=False):
+    def run(self, thunk, num_cpu=1, data_dir=None, datestamp=False, params={}, pickle=True):
         """
         Run each variant in the grid with function 'thunk'.
 
@@ -545,7 +570,7 @@ class ExperimentGrid:
                 thunk_ = thunk
 
             call_experiment(exp_name, thunk_, num_cpu=num_cpu,
-                            data_dir=data_dir, datestamp=datestamp, **var)
+                            data_dir=data_dir, datestamp=datestamp, params=params, pickle=pickle, **var)
 
 
 def test_eg():

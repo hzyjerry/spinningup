@@ -2,16 +2,18 @@ from copy import deepcopy
 import itertools
 import numpy as np
 import torch
+import os, sys
 from torch.optim import Adam
 import gym
 import upn.envs
+import datetime
 import time
 import spinup.algos.pytorch.sac.core as core
 from spinup.utils.logx import EpochLogger
 from functools import partial
 from torch.utils.tensorboard import SummaryWriter
-
-
+from spinup.utils.mpi_tools import proc_id
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 class ReplayBuffer:
     """
@@ -24,26 +26,57 @@ class ReplayBuffer:
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.done_buf = np.zeros(size, dtype=np.float32)
+        self.feats_buf = {}
         self.ptr, self.size, self.max_size = 0, 0, size
 
-    def store(self, obs, act, rew, next_obs, done):
+    def store_vec(self, obs, act, rew, next_obs, done, feats):
+        for i in range(len(obs)):
+            self.store(obs[i], act[i], rew[i], next_obs[i], done[i], feats[i])
+
+    @property
+    def feats_keys(self):
+        return list(self.feats_buf.keys())
+
+    def store(self, obs, act, rew, next_obs, done, feats):
         self.obs_buf[self.ptr] = obs
         self.obs2_buf[self.ptr] = next_obs
         self.act_buf[self.ptr] = act
         self.rew_buf[self.ptr] = rew
         self.done_buf[self.ptr] = done
+        for key, val in feats.items():
+            if key not in self.feats_buf:
+                self.feats_buf[key] = np.zeros(self.max_size, dtype=np.float32)
+            self.feats_buf[key][self.ptr] = val
+
         self.ptr = (self.ptr+1) % self.max_size
         self.size = min(self.size+1, self.max_size)
 
     def sample_batch(self, batch_size=32):
         idxs = np.random.randint(0, self.size, size=batch_size)
+        feats = {}
+        for key, val in self.feats_buf.items():
+            feats[key] = torch.as_tensor(self.feats_buf[key][idxs], dtype=torch.float32)
         batch = dict(obs=self.obs_buf[idxs],
                      obs2=self.obs2_buf[idxs],
                      act=self.act_buf[idxs],
                      rew=self.rew_buf[idxs],
                      done=self.done_buf[idxs])
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
+        batch = {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
+        batch["feats"] = feats
+        return batch
 
+    def get_size(self):
+        total_size = 0
+        for obj in [self.obs_buf, self.obs2_buf, self.act_buf, self.rew_buf, self.done_buf] + list(self.feats_buf.values()):
+            total_size += sys.getsizeof(obj)
+        return total_size
+
+
+def sac_rl(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, **kwargs):
+    env = env_fn()
+    coeff_dim = env.coeff_dim
+    _actor_critic = partial(actor_critic, coeff_dim=coeff_dim)
+    return sac(env_fn, env_name, test_env_fns=test_env_fns, actor_critic=_actor_critic, **kwargs)
 
 
 def sac_upn(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCriticUPNNaive, **kwargs):
@@ -57,7 +90,7 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99,
         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=100, start_steps=10000,
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000,
-        logger_kwargs=dict(), save_freq=1):
+        logger_kwargs=dict(), save_freq=1, load_dir=None, num_procs=1, clean_every=200):
     """
     Soft Actor-Critic (SAC)
 
@@ -154,15 +187,20 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
             the current policy and value function.
 
     """
+    from spinup.examples.pytorch.eval_sac import load_pytorch_policy
 
-    writer = SummaryWriter(comment=logger_kwargs["exp_name"])
+
+    print(f"SAC proc_id {proc_id()}")
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
+    if proc_id() == 0:
+        writer = SummaryWriter(log_dir=os.path.join(logger.output_dir, str(datetime.datetime.now())), comment=logger_kwargs["exp_name"])
 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    env, test_envs = env_fn(), [fn() for fn in test_env_fns]
+    env = SubprocVecEnv([partial(env_fn, rank=i) for i in range(num_procs)], "spawn")
+    test_env = SubprocVecEnv(test_env_fns, "spawn")
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape[0]
 
@@ -170,7 +208,10 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
     act_limit = env.action_space.high[0]
 
     # Create actor-critic module and target networks
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    if load_dir is not None:
+        _, ac = load_pytorch_policy(load_dir, itr="", deterministic=False)
+    else:
+        ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
     ac_targ = deepcopy(ac)
 
     # Freeze target networks with respect to optimizers (only update via polyak averaging)
@@ -216,6 +257,37 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
 
         return loss_q, q_info
 
+    # Set up function for computing TD feats-losses
+    def compute_loss_feats(data):
+        o, a, r, o2, d, feats = data['obs'], data['act'], data['rew'], data['obs2'], data['done'], data["feats"]
+
+        feats = torch.stack(list(feats.values())).T # (nbatch, nfeats)
+        feats1 = ac.q1.predict_feats(o,a)
+        feats2 = ac.q2.predict_feats(o,a)
+
+        feats_keys = replay_buffer.feats_keys
+
+        # Bellman backup for feature functions
+        with torch.no_grad():
+            a2, _ = ac.pi(o2)
+
+            # Target feature values
+            feats1_targ = ac_targ.q1.predict_feats(o2, a2)
+            feats2_targ = ac_targ.q2.predict_feats(o2, a2)
+            feats_targ = torch.min(feats1_targ, feats2_targ)
+            backup = feats + gamma * (1 - d[:, None]) * feats_targ
+
+        # MSE loss against Bellman backup
+        loss_feats1 = ((feats1 - backup)**2).mean(axis=0)
+        loss_feats2 = ((feats2 - backup)**2).mean(axis=0)
+        loss_feats = loss_feats1 + loss_feats2
+
+        # Useful info for logging
+        feats_info = dict(Feats1Vals=feats1.detach().numpy(),
+                          Feats2Vals=feats1.detach().numpy())
+
+        return loss_feats, feats_info
+
     # Set up function for computing SAC pi loss
     def compute_loss_pi(data):
         o = data['obs']
@@ -239,7 +311,7 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
     # Set up model saving
     logger.setup_pytorch_saver(ac)
 
-    def update(data):
+    def update(data, feats_keys):
         # First run one gradient descent step for Q1 and Q2
         q_optimizer.zero_grad()
         loss_q, q_info = compute_loss_q(data)
@@ -248,6 +320,11 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
 
         # Record things
         logger.store(LossQ=loss_q.item(), **q_info)
+
+        # Feature loss
+        loss_feats, feats_info = compute_loss_feats(data)
+        keys = [f"LossFeats_{key}" for key in feats_keys]
+        logger.store(**dict(zip(keys, loss_feats)))
 
         # Freeze Q-networks so you don't waste computational effort
         # computing gradients for them during the policy learning step.
@@ -279,68 +356,81 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
         return ac.act(torch.as_tensor(o, dtype=torch.float32),
                       deterministic)
 
-    def test_agent():
-        for ti, test_env in enumerate(test_envs):
-            import pdb; pdb.set_trace()
-            env_ep_ret = 0
-            for j in range(num_test_episodes):
-                o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
-                while not (d or (ep_len == max_ep_len)):
-                    # Take deterministic actions at test time
-                    o, r, d, _ = test_env.step(get_action(o, True))
-                    ep_ret += r
-                    ep_len += 1
-                    env_ep_ret += r
-                logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
-            logger.store(**{f"TestEpRet_{ti}": env_ep_ret / num_test_episodes})
+    def test_agent(feats_keys):
+        num_envs = len(test_env_fns)
+        env_ep_rets = np.zeros(num_envs)
+        for j in range(num_test_episodes):
+            o, d  = test_env.reset(), np.zeros(num_envs, dtype=bool)
+            ep_len = np.zeros(num_envs)
+            while not (np.all(d) or np.all(ep_len == max_ep_len)):
+                # Take deterministic actions at test time
+                o, r, d, info = test_env.step(get_action(o, True))
+                env_ep_rets += r
+                ep_len += 1
+            # logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+        for ti in range(num_envs):
+            logger.store(**{f"TestEpRet_{ti}": env_ep_rets[ti] / num_test_episodes})
 
     # Prepare for interaction with environment
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
-    o, ep_ret, ep_len = env.reset(), 0, 0
+    o, ep_ret, ep_len = env.reset(), np.zeros(num_procs), np.zeros(num_procs)
 
     # Main loop: collect experience in env and update/log each epoch
-    for t in range(total_steps):
-
+    epoch = 0
+    update_times, clean_times = 0, 0
+    t = 0
+    while t <= total_steps:
         # Until start_steps have elapsed, randomly sample actions
         # from a uniform distribution for better exploration. Afterwards,
         # use the learned policy.
         if t > start_steps:
             a = get_action(o)
         else:
-            a = env.action_space.sample()
+            a = np.stack([env.action_space.sample() for _ in range(num_procs)])
 
         # Step the env
-        o2, r, d, _ = env.step(a)
+        o2, r, d, info = env.step(a)
         ep_ret += r
         ep_len += 1
 
         # Ignore the "done" signal if it comes from hitting the time
         # horizon (that is, when it's an artificial terminal signal
         # that isn't based on the agent's state)
-        d = False if ep_len==max_ep_len else d
+        if np.all(ep_len == max_ep_len):
+            d.fill(False)
 
         # Store experience to replay buffer
-        replay_buffer.store(o, a, r, o2, d)
+        replay_buffer.store_vec(o, a, r, o2, d, [inf["features"] for inf in info])
 
         # Super critical, easy to overlook step: make sure to update
         # most recent observation!
         o = o2
 
-        # End of trajectory handling
-        if d or (ep_len == max_ep_len):
+        # End of trajectory handling, assumes all subenvs end at the same time
+        if np.all(d) or np.all(ep_len == max_ep_len):
             logger.store(EpRet=ep_ret, EpLen=ep_len)
-            o, ep_ret, ep_len = env.reset(), 0, 0
+
+            if clean_every > 0 and epoch // clean_every >= clean_times:
+                env.close()
+                test_env.close()
+                env = SubprocVecEnv([partial(env_fn, rank=i) for i in range(num_procs)], "spawn")
+                test_env = SubprocVecEnv(test_env_fns, "spawn")
+                clean_times += 1
+
+            o, ep_ret, ep_len = env.reset(), np.zeros(num_procs), np.zeros(num_procs)
 
         # Update handling
-        if t >= update_after and t % update_every == 0:
+        if t >= update_after and t / update_every > update_times:
             for j in range(update_every):
                 batch = replay_buffer.sample_batch(batch_size)
-                update(data=batch)
+                update(data=batch, feats_keys=replay_buffer.feats_keys)
+            update_times += 1
+
 
         # End of epoch handling
-        if (t+1) % steps_per_epoch == 0:
-            epoch = (t+1) // steps_per_epoch
+        if t // steps_per_epoch > epoch:
+            epoch = t // steps_per_epoch
 
             # Save model
             if (epoch % save_freq == 0) or (epoch == epochs):
@@ -351,27 +441,26 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
                     #logger.save_state({'env_name': env_name}, None)
 
             # Test the performance of the deterministic version of the agent.
-            test_agent()
+            test_agent(replay_buffer.feats_keys)
 
             # Update tensorboard
-            log_perf_board = ['EpRet','EpLen','Q1Vals','Q2Vals', 'TestEpRet','TestEpLen'] + [f"TestEpRet_{ti}" for ti in range(len(test_env_fns))]
-            log_loss_board = ['LogPi', 'LossPi','LossQ']
-            log_board = {'Performance': log_perf_board, 'Loss': log_loss_board}
-            for key,value in log_board.items():
-                for val in value:
-                    mean, std = logger.get_stats(val)
-                    if key=='Performance':
-                        writer.add_scalar(key+'/Average'+val, mean, epoch)
-                        writer.add_scalar(key+'/Std'+val, std, epoch)
-                    else:
-                        writer.add_scalar(key+'/'+val, mean, epoch)
+            if proc_id() == 0:
+                log_perf_board = ['EpRet','EpLen','Q1Vals','Q2Vals'] + [f"TestEpRet_{ti}" for ti in range(len(test_env_fns))]
+                log_loss_board = ['LogPi', 'LossPi','LossQ'] + [key for key in logger.epoch_dict.keys() if "LossFeats" in key]
+                log_board = {'Performance': log_perf_board, 'Loss': log_loss_board}
+                for key,value in log_board.items():
+                    for val in value:
+                        mean, std = logger.get_stats(val)
+                        if key=='Performance':
+                            writer.add_scalar(key+'/Average'+val, mean, epoch)
+                            writer.add_scalar(key+'/Std'+val, std, epoch)
+                        else:
+                            writer.add_scalar(key+'/'+val, mean, epoch)
 
             # Log info about epoch
             logger.log_tabular('Epoch', epoch)
             logger.log_tabular('EpRet', with_min_and_max=True)
-            logger.log_tabular('TestEpRet', with_min_and_max=True)
             logger.log_tabular('EpLen', average_only=True)
-            logger.log_tabular('TestEpLen', average_only=True)
             logger.log_tabular('TotalEnvInteracts', t)
             logger.log_tabular('Q1Vals', with_min_and_max=True)
             logger.log_tabular('Q2Vals', with_min_and_max=True)
@@ -381,8 +470,24 @@ def sac(env_fn, env_name, test_env_fns=[], actor_critic=core.MLPActorCritic, ac_
             logger.log_tabular('Time', time.time()-start_time)
             logger.dump_tabular()
 
-            writer.flush()
-    writer.close()
+            if proc_id() == 0:
+                writer.flush()
+
+                import psutil
+                # gives a single float value
+                cpu_percent = psutil.cpu_percent()
+                # gives an object with many fields
+                mem_percent = psutil.virtual_memory().percent
+                print(f"Used cpu avg {cpu_percent}% memory {mem_percent}%")
+                cpu_separate = psutil.cpu_percent(percpu=True)
+                for ci, cval in enumerate(cpu_separate):
+                    print(f"\t cpu {ci}: {cval}%")
+                # buf_size = replay_buffer.get_size()
+                # print(f"Replay buffer size: {buf_size//1e6}MB {buf_size // 1e3} KB {buf_size % 1e3} B")
+        t += num_procs
+
+    if proc_id() == 0:
+        writer.close()
 
 
 if __name__ == '__main__':
@@ -402,7 +507,11 @@ if __name__ == '__main__':
 
     torch.set_num_threads(torch.get_num_threads())
 
-    sac(lambda : gym.make(args.env), args.env, actor_critic=core.MLPActorCritic,
+    def env_fn():
+        import upn.envs
+        return gym.make(args.env)
+
+    sac(env_fn, args.env, actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l),
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
         logger_kwargs=logger_kwargs)
